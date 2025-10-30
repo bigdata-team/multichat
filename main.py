@@ -8,7 +8,6 @@ import os
 import tempfile
 import uuid
 import threading
-import time
 from queue import Queue, Empty
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -101,8 +100,58 @@ CSV_FIELDNAMES = [
     "user_message",
     "assistant_response",
     "like",
+    "dislike",
 ]
 STATE_DEFAULT_VISIBLE = [True] + [False] * (MAX_CHAT_SECTIONS - 1)
+
+REACTION_NONE = ""
+REACTION_LIKE = "like"
+REACTION_DISLIKE = "dislike"
+
+
+def _normalize_feedback_state_value(value: Any) -> str:
+    """Normalize persisted feedback values to canonical reaction labels."""
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if "dislike" in lowered or "down" in lowered or lowered == "👎":
+            return REACTION_DISLIKE
+        if "like" in lowered or "up" in lowered or lowered == "👍":
+            return REACTION_LIKE
+        return value.strip()
+    if value is True:
+        return REACTION_LIKE
+    return REACTION_NONE
+
+
+def _reaction_flags(value: str) -> Tuple[bool, bool]:
+    """Convert canonical reaction label into like/dislike boolean flags."""
+    return value == REACTION_LIKE, value == REACTION_DISLIKE
+
+
+def _reaction_from_event(event: gr.LikeData, previous: str) -> str:
+    """Derive the new reaction from a LikeData event, supporting toggling off."""
+    payload = getattr(event, "_data", {}) or {}
+    selected = payload.get("selected")
+    liked_attr = payload.get("liked", getattr(event, "liked", None))
+    label = payload.get("label") or payload.get("button") or payload.get("feedback")
+
+    if selected is False:
+        return REACTION_NONE
+    if liked_attr is None and selected is None:
+        return REACTION_NONE
+
+    if isinstance(liked_attr, bool):
+        reaction = REACTION_LIKE if liked_attr else REACTION_DISLIKE
+    elif isinstance(liked_attr, str):
+        reaction = _normalize_feedback_state_value(liked_attr)
+    elif isinstance(label, str):
+        reaction = _normalize_feedback_state_value(label)
+    else:
+        reaction = REACTION_NONE
+
+    if reaction == previous:
+        return REACTION_NONE
+    return reaction
 
 
 def _sanitize_log_entries(entries: Any) -> List[Dict[str, Any]]:
@@ -116,6 +165,7 @@ def _sanitize_log_entries(entries: Any) -> List[Dict[str, Any]]:
             continue
         record = {field: item.get(field, "") for field in CSV_FIELDNAMES}
         record["like"] = bool(item.get("like", False))
+        record["dislike"] = bool(item.get("dislike", False))
         sanitized.append(record)
 
     return sanitized
@@ -280,7 +330,6 @@ html, body {height: 100%; margin: 0; background: #f3f4f6;}
 .chat-section h4 {margin: 0;}
 .chat-section .gradio-chatbot, .chat-section [data-testid="chatbot"] {flex: 1 1 auto;}
 .full-width {width: 100%;}
-.latency { font-size: 10px; color: #9ca3af; margin-left: .4rem; }
 """
 
 BIND_LABEL = "Bind chats"
@@ -463,44 +512,15 @@ def _history_to_messages(history: Sequence[Tuple[str, str]]) -> List[Dict[str, s
     return messages
 
 
-# --- Helper functions for stopped/latency tags ---
+# --- Helper function for stopped tag ---
 def _append_stopped_tag(a_text: str) -> str:
-    """
-    Append ' [stopped]' to assistant text, keeping any latency badge on a new line intact.
-    If a latency badge exists, add the tag before the badge.
-    """
+    """Append ' [stopped]' to assistant text if it is not already present."""
     a_text = str(a_text or "")
-    marker = 'class="latency"'
     if not a_text:
         return "[stopped]"
-    if marker in a_text:
-        # Keep the badge on the next line; only modify the first (main) line.
-        parts = a_text.split('\n', 1)
-        main_txt = parts[0]
-        rest = ('\n' + parts[1]) if len(parts) > 1 else ''
-        if "[stopped]" not in main_txt:
-            main_txt = f"{main_txt} [stopped]"
-        return main_txt + rest
     if "[stopped]" not in a_text:
         return f"{a_text} [stopped]"
     return a_text
-
-
-def _inject_latency(a_text: str, ms: Optional[int]) -> str:
-    """
-    Ensure a latency badge is present exactly once at the end of the message (on a new line).
-    If ms is None, return the text unchanged.
-    """
-    if ms is None:
-        return str(a_text or "")
-    a_text = str(a_text or "")
-    badge = f'<span class="latency">{ms} ms</span>'
-    if 'class="latency"' in a_text:
-        return a_text
-    # Always put the badge on a new line for readability.
-    if a_text.endswith('\n'):
-        return a_text + badge
-    return a_text + '\n' + badge
 
 
 def _handle_feedback_event(
@@ -510,7 +530,10 @@ def _handle_feedback_event(
     chat_index: int,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Persist feedback selections and refresh existing log entries."""
-    store: Dict[str, Any] = dict(feedback_store or {})
+    store_raw: Dict[str, Any] = dict(feedback_store or {})
+    store: Dict[str, str] = {
+        str(k): _normalize_feedback_state_value(v) for k, v in store_raw.items()
+    }
     entries: List[Dict[str, Any]] = [dict(entry) for entry in (log_entries or [])]
 
     def finalize(payload: Sequence[Dict[str, Any]]) -> Tuple[
@@ -531,27 +554,23 @@ def _handle_feedback_event(
         except (TypeError, ValueError):
             return finalize(entries)
 
-    selected = getattr(event, "selected", None)
-    raw_value = getattr(event, "value", None)
-    if selected is None:
-        if isinstance(raw_value, dict):
-            selected = bool(raw_value.get("selected"))
-        elif raw_value is None:
-            selected = False
-        else:
-            selected = bool(raw_value)
-    like_flag = bool(selected)
-
     key = f"{chat_index}:{message_index}"
-    store[key] = like_flag
+    previous_reaction = store.get(key, REACTION_NONE)
+    new_reaction = _reaction_from_event(event, previous_reaction)
+    if new_reaction:
+        store[key] = new_reaction
+    else:
+        store.pop(key, None)
 
-    like_value = store.get(key, False)
+    final_reaction = store.get(key, REACTION_NONE)
+    like_value, dislike_value = _reaction_flags(final_reaction)
     for entry in entries:
         if (
             entry.get("chat_index") == chat_index
             and entry.get("message_index") == message_index
         ):
             entry["like"] = like_value
+            entry["dislike"] = dislike_value
 
     return finalize(entries)
 
@@ -700,16 +719,18 @@ def dispatch_message(
     temperatures = list(args[2 * size : 3 * size])
     models = list(args[3 * size : 4 * size])
     user_values = list(args[4 * size : 5 * size])
-    feedback_store = (
-        {k: bool(v) for k, v in dict(args[5 * size]).items()}
+    raw_feedback = (
+        dict(args[5 * size])
         if len(args) > 5 * size and isinstance(args[5 * size], dict)
         else {}
     )
+    feedback_store: Dict[str, str] = {}
+    for key, value in raw_feedback.items():
+        normalized = _normalize_feedback_state_value(value)
+        if normalized in (REACTION_LIKE, REACTION_DISLIKE):
+            feedback_store[str(key)] = normalized
     existing_logs = (
-        [
-            {**entry, "like": bool(entry.get("like", False))}
-            for entry in list(args[5 * size + 1])
-        ]
+        list(args[5 * size + 1])
         if len(args) > 5 * size + 1 and isinstance(args[5 * size + 1], list)
         else []
     )
@@ -749,10 +770,6 @@ def dispatch_message(
         "" if idx in valid_indices else user_values[idx] for idx in range(size)
     ]
 
-    # Measure first token latency per active chat
-    start_times: Dict[int, float] = {}
-    first_token_ms: Dict[int, Optional[int]] = {}
-
     active_generators: List[Dict[str, Any]] = []
     for idx in valid_indices:
         previous_history = histories[idx][:]
@@ -766,8 +783,6 @@ def dispatch_message(
             )
         )
         histories[idx] = previous_history + [(message, "")]
-        start_times[idx] = time.monotonic()
-        first_token_ms[idx] = None
         active_generators.append(
             {
                 "idx": idx,
@@ -805,12 +820,7 @@ def dispatch_message(
                     active_set.remove(idx)
                     _end_stream_cancel(idx)
             else:
-                if first_token_ms.get(idx) is None:
-                    try:
-                        first_token_ms[idx] = int((time.monotonic() - start_times[idx]) * 1000)
-                    except Exception:
-                        first_token_ms[idx] = None
-                histories[idx][-1] = (message, _inject_latency(str(payload), first_token_ms.get(idx)))
+                histories[idx][-1] = (message, str(payload))
                 yield package_outputs(cleared_inputs, log_entries)
 
         # Check for explicit stop signals even if no chunks arrive
@@ -834,13 +844,6 @@ def dispatch_message(
     # All current streams are done; lower the global stop flag for future sessions
     GLOBAL_STOP.clear()
 
-    # Ensure latency badge is present in the final message text
-    for idx in valid_indices:
-        msg_idx = len(histories[idx]) - 1
-        if msg_idx >= 0:
-            u, a = histories[idx][msg_idx]
-            histories[idx][msg_idx] = (u, _inject_latency(str(a or ""), first_token_ms.get(idx)))
-
     if valid_indices:
         timestamp = _dt.datetime.now(_dt.timezone.utc).isoformat()
         base_id = uuid.uuid4().hex
@@ -856,6 +859,7 @@ def dispatch_message(
                 f"{models[idx]}|{temperatures[idx]}|{system_prompts[idx]}"
             )
             request_hash = hashlib.md5(request_hash_input.encode("utf-8")).hexdigest()
+            reaction_flags = _reaction_flags(feedback_store.get(like_key, REACTION_NONE))
             new_entries.append(
                 {
                     "interaction_id": base_id,
@@ -869,7 +873,8 @@ def dispatch_message(
                     "model": models[idx],
                     "user_message": user_text,
                     "assistant_response": assistant_text,
-                    "like": bool(feedback_store.get(like_key, False)),
+                    "like": reaction_flags[0],
+                    "dislike": reaction_flags[1],
                 }
             )
 
@@ -899,19 +904,12 @@ def send_or_stop(
     temperatures = list(args[2 * size : 3 * size])
     models = list(args[3 * size : 4 * size])
     user_values = list(args[4 * size : 5 * size])
-    feedback_state = (
-        {k: bool(v) for k, v in dict(args[5 * size]).items()}
-        if len(args) > 5 * size and isinstance(args[5 * size], dict)
-        else {}
-    )
-    existing_logs = (
-        [
-            {**entry, "like": bool(entry.get("like", False))}
-            for entry in list(args[5 * size + 1])
-        ]
+    existing_logs_raw = (
+        list(args[5 * size + 1])
         if len(args) > 5 * size + 1 and isinstance(args[5 * size + 1], list)
         else []
     )
+    log_entries = _sanitize_log_entries(existing_logs_raw)
 
     # Stop ALL ongoing streams (global stop), regardless of bind state or origin
     stopped_count = stop_all_generation()
@@ -920,7 +918,7 @@ def send_or_stop(
     # Helper to package a no-op output (used when stopping)
     def package_current(button_updates: List[Any], streaming_values: List[bool]):
         display_histories = [_history_to_messages(hist) for hist in histories]
-        log_payload = existing_logs
+        log_payload = [dict(entry) for entry in log_entries]
         return (
             *display_histories,
             *user_values,
@@ -1075,7 +1073,7 @@ def _reconstruct_session_from_logs(
         for _ in range(MAX_CHAT_SECTIONS)
     ]
     visible_flags = [False for _ in range(MAX_CHAT_SECTIONS)]
-    feedback_state: Dict[str, bool] = {}
+    feedback_state: Dict[str, str] = {}
     sync_enabled = True
 
     for entry in logs:
@@ -1110,7 +1108,13 @@ def _reconstruct_session_from_logs(
         visible_flags[chat_index] = True
 
         feedback_key = f"{chat_index}:{message_index}"
-        feedback_state[feedback_key] = bool(entry.get("like", False))
+        reaction = REACTION_NONE
+        if bool(entry.get("dislike", False)):
+            reaction = REACTION_DISLIKE
+        elif bool(entry.get("like", False)):
+            reaction = REACTION_LIKE
+        if reaction:
+            feedback_state[feedback_key] = reaction
 
         sync_mode = entry.get("sync_mode")
         if isinstance(sync_mode, str):
@@ -1301,7 +1305,7 @@ def build_demo() -> gr.Blocks:
                                     label="Conversation",
                                     height=360,
                                     type="messages",
-                                    feedback_options=("Like",),
+                                    feedback_options=("Like", "Dislike"),
                                 )
                                 chatbots.append(chatbot)
 
