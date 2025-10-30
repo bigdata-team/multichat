@@ -1,3 +1,5 @@
+## `main.py` 함수 정의
+
 ### 📌 스트림 제어 함수  
 `_begin_stream_cancel(idx)` - 특정 채팅의 스트림 취소 이벤트 생성 및 등록  
 `_end_stream_cancel(idx)` - 스트림 취소 이벤트 제거  
